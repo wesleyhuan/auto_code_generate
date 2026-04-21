@@ -1,0 +1,5 @@
+{
+  "name": "Auto Code Generator",
+  "description": "An automated code generator for hardware testing configurations, supporting Excel uploads and multiple test parameters.",
+  "requestFramePermissions": []
+}
