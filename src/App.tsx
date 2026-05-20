@@ -188,6 +188,15 @@ ON_FAIL={reconnect_io_seq};
         { testName: 'readff_chip_vtyp_test', passBranch: 'readff_chip_vmax_test', failBranch: 'Bin30' },
         { testName: 'readff_chip_vmax_test', passBranch: 'Bin1', failBranch: 'Bin51' }
       ]
+    },
+    {
+      name: 'pgm_Vmin_FLOW',
+      entries: [
+        { testName: 'pgm00_vpp_min_test', passBranch: 'readff_chip_vmin_test', failBranch: 'Bin10' },
+        { testName: 'readff_chip_vmin_test', passBranch: 'readff_chip_vtyp_test', failBranch: 'Bin20' },
+        { testName: 'readff_chip_vtyp_test', passBranch: 'readff_chip_vmax_test', failBranch: 'Bin30' },
+        { testName: 'readff_chip_vmax_test', passBranch: 'Bin1', failBranch: 'Bin51' }
+      ]
     }
   ],
   power: {
@@ -217,7 +226,7 @@ ON_FAIL={reconnect_io_seq};
     x: { msb: 'PA8', lsb: 'PA3' },
     y: { msb: 'PA2', lsb: 'PA0' }
   },
-  qData: Array(16).fill(0).map((_, i) => ({ name: `Qdata${i}`, value: '00' })),
+  qData: Array(16).fill(0).map((_, i) => ({ name: `Qdata${i}`, value: '00', addressX: '0', addressY: '0' })),
   powerUpSequence: ['DVDD', 'VDD', 'VPP'],
   readModeParams: {
     taa: 200,
@@ -230,14 +239,23 @@ ON_FAIL={reconnect_io_seq};
       { pin: 'CBIASMGN_VT', status: 'H' },
     ]
   },
+  pgmMode: {
+    powerSwitch: 'yes',
+    pgmTimeMin: '90us',
+    pgmTimeMax: '350us',
+    period: '10us'
+  },
   mgnReadData: [],
-  periods: [20, 50, 70, 80, 100, 113, 150, 200, 213, 220, 250, 300, 400, 413, 450, 500, 1000, 1013, 2000, 3000, 4000, 5000, 6000, 10000, 50000]
+  periods: [20, 50, 70, 80, 100, 113, 150, 200, 213, 220, 250, 300, 400, 413, 450, 500, 1000, 1013, 2000, 3000, 4000, 5000, 6000, 10000, 50000],
+  socketWarnings: []
 };
 
 export default function App() {
   const [state, setState] = useState<AppState>(DEFAULT_STATE);
-  const [activeTab, setActiveTab] = useState<keyof AppState | 'preview' | 'sequences' | 'flows' | 'setQPreview'>('socket');
+  const [activeTab, setActiveTab] = useState<keyof AppState | 'preview' | 'sequences' | 'flows' | 'setQPreview' | 'pgm00Preview'>('socket');
   const [activeTableSet, setActiveTableSet] = useState<'read' | 'normal'>('read');
+  const [pgm00SelectedTime, setPgm00SelectedTime] = useState<'min' | 'max'>('min');
+  const [pgm00SelectedDataType, setPgm00SelectedDataType] = useState<string>('0x00');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const getBitRange = (msb: string, lsb: string) => {
@@ -265,6 +283,15 @@ export default function App() {
       return Number.isFinite(n) ? n : undefined;
     };
 
+    const cleanPinName = (name: string) => {
+      if (!name) return '';
+      let cleaned = name.replace(/[<>:]/g, '').trim();
+      if (cleaned.toUpperCase() === 'RESET') {
+        return 'PRESET';
+      }
+      return cleaned;
+    };
+
     const reader = new FileReader();
     reader.onload = (evt) => {
       const bstr = evt.target?.result;
@@ -278,6 +305,7 @@ export default function App() {
       let newPowerUpSequence = [...state.powerUpSequence];
       let newTests = [...state.tests];
       let newVariables = [...state.variables];
+      let newPgmMode = { ...state.pgmMode };
       let newMgnReadData = [...state.mgnReadData];
       let newPeriods = [...state.periods];
 
@@ -413,53 +441,81 @@ export default function App() {
       const qWs = wb.Sheets['Q option'];
       if (qWs) {
         const qDataRaw = XLSX.utils.sheet_to_json(qWs, { header: 1 }) as any[][];
-        const extractedQData: { name: string; value: string }[] = [];
+        const extractedQData: AppState['qData'] = [];
         
         let currentVarName = '';
         let currentByteVal = 0;
         let bitInByteCount = 0;
+        let currentAddressX = '0';
+        let currentAddressY = '0';
+
+        let currentStartBit: number | undefined = undefined;
+        let currentEndBit: number | undefined = undefined;
 
         for (let r = 0; r < qDataRaw.length; r++) {
           const row = qDataRaw[r] || [];
           const varNameCell = String(row[0] || '').trim();
           const bitNameCell = String(row[1] || '').trim();
           const valueCell = String(row[2] || '').trim().toUpperCase();
+          const addressXCell = String(row[3] || '').trim();
+          const addressYCell = String(row[4] || '').trim();
 
           if (varNameCell) {
-            // If we have a previous variable that wasn't finished (e.g. fewer than 8 bits)
+            // If we have a previous variable that wasn't finished
             if (currentVarName && bitInByteCount > 0) {
               extractedQData.push({
                 name: currentVarName,
-                value: currentByteVal.toString(16).padStart(2, '0').toUpperCase()
+                value: currentByteVal.toString(16).padStart(2, '0').toUpperCase(),
+                addressX: currentAddressX,
+                addressY: currentAddressY,
+                startBit: currentStartBit,
+                endBit: currentEndBit
               });
             }
             currentVarName = varNameCell;
             currentByteVal = 0;
             bitInByteCount = 0;
+            currentAddressX = addressXCell || '0';
+            currentAddressY = addressYCell || '0';
+            currentStartBit = undefined;
+            currentEndBit = undefined;
           }
 
-          if (bitNameCell.match(/Q<\d+>/i)) {
+          const qMatch = bitNameCell.match(/Q<(\d+)>/i);
+          if (qMatch) {
+            const bitNum = parseInt(qMatch[1]);
+            if (currentStartBit === undefined) currentStartBit = bitNum;
+            currentEndBit = bitNum;
+
             const bit = valueCell === 'VDD' ? 1 : 0;
-            // The first bit in the group is MSB (bit 7)
             currentByteVal = (currentByteVal << 1) | bit;
             bitInByteCount++;
             
             if (bitInByteCount === 8) {
               extractedQData.push({
                 name: currentVarName,
-                value: currentByteVal.toString(16).padStart(2, '0').toUpperCase()
+                value: currentByteVal.toString(16).padStart(2, '0').toUpperCase(),
+                addressX: currentAddressX,
+                addressY: currentAddressY,
+                startBit: currentStartBit,
+                endBit: currentEndBit
               });
               bitInByteCount = 0;
-              currentVarName = ''; // Reset so we don't push it again if next row has a varName
+              currentVarName = ''; 
+              currentStartBit = undefined;
+              currentEndBit = undefined;
             }
           }
         }
         
-        // Push last one if loop ended and we have data
         if (currentVarName && bitInByteCount > 0) {
           extractedQData.push({
             name: currentVarName,
-            value: currentByteVal.toString(16).padStart(2, '0').toUpperCase()
+            value: currentByteVal.toString(16).padStart(2, '0').toUpperCase(),
+            addressX: currentAddressX,
+            addressY: currentAddressY,
+            startBit: currentStartBit,
+            endBit: currentEndBit
           });
         }
 
@@ -468,60 +524,115 @@ export default function App() {
         }
       }
 
+      // Process pgm mode Sheet
+      const pgmModeWs = wb.Sheets['pgm mode'];
+      if (pgmModeWs) {
+        const raw = XLSX.utils.sheet_to_json(pgmModeWs, { header: 1 }) as any[][];
+        let pgmMode = { ...state.pgmMode };
+        
+        // Find row with headers
+        const headerRowIdx = raw.findIndex(row => row && row.some(c => String(c || '').toLowerCase().includes('power switch')));
+        if (headerRowIdx !== -1) {
+          const headers = raw[headerRowIdx].map(h => String(h || '').toLowerCase().trim());
+          const dataRow = raw[headerRowIdx + 1] || [];
+          
+          headers.forEach((h, i) => {
+            if (h === 'power switch') pgmMode.powerSwitch = String(dataRow[i] || 'yes').trim().toLowerCase();
+            if (h === 'pgm time min') pgmMode.pgmTimeMin = String(dataRow[i] || '90us').trim();
+            if (h === 'pgm time max') pgmMode.pgmTimeMax = String(dataRow[i] || '350us').trim();
+            if (h === 'period') pgmMode.period = String(dataRow[i] || '10us').trim();
+          });
+          newPgmMode = pgmMode;
+        }
+      }
+
       // Process Socket Sheet
       const socketWs = wb.Sheets['socket'] || wb.Sheets[wb.SheetNames[0]];
       if (socketWs) {
         const socketData = XLSX.utils.sheet_to_json(socketWs, { header: 1 }) as any[][];
-        
-        // Find X/Y mapping and Pin Names
-        socketData.forEach((row, rowIndex) => {
-          if (!row || row.length === 0) return;
+        let foundBlock1 = false;
+        let foundBlock2 = false;
+        const socketWarnings: string[] = [];
 
-          const firstCell = row[0]?.toString().trim().toUpperCase();
+        for (let r = 0; r < socketData.length; r++) {
+          const row = socketData[r] || [];
           
-          // X/Y Mapping detection
-          if (firstCell === 'X') {
-            newMapping.x = { msb: row[1]?.toString() || 'PA8', lsb: row[2]?.toString() || 'PA3' };
-          } else if (firstCell === 'Y') {
-            newMapping.y = { msb: row[1]?.toString() || 'PA2', lsb: row[2]?.toString() || 'PA0' };
+          // Check for Block 1 (DP 24 down to 1)
+          const isBlock1Row = row.some(cell => String(cell) === '24') && row.some(cell => String(cell) === '1');
+          if (!foundBlock1 && isBlock1Row) {
+            const dpRow = row;
+            const nameRow = socketData[r + 1] || [];
+            const typeRow = socketData[r + 2] || [];
+            const naRow = socketData[r + 3] || [];
+            const valueRow = socketData[r + 4] || [];
+
+            dpRow.forEach((cell, cIdx) => {
+              const dp = parseInt(String(cell));
+              if (!isNaN(dp) && dp >= 1 && dp <= 24) {
+                const name = cleanPinName(String(nameRow[cIdx] || ''));
+                const type = String(typeRow[cIdx] || '').trim();
+                const na = String(naRow[cIdx] || '').trim();
+                const value = String(valueRow[cIdx] || '').trim();
+
+                if (name) {
+                  newSocket[dp - 1] = { id: dp, name, type, na, value };
+                  const validTypes = ['PWR_PIN', 'INPUT_PIN', 'IO_PIN', 'GND_PIN'];
+                  if (type && !validTypes.includes(type)) {
+                    socketWarnings.push(`DP${dp} (${name}) has non-standard type: "${type}"`);
+                  }
+                }
+              }
+            });
+            foundBlock1 = true;
           }
 
-          // Pin Name Layout detection (Heuristic based on provided snippet)
-          // Look for rows that look like pin name lists (many strings, some with < >)
-          const isPinRow = row.filter(cell => cell && typeof cell === 'string' && (cell.includes('<') || cell.length > 2)).length > 10;
-          
-          if (isPinRow) {
-            // Check if previous or next row contains DP numbers to identify which range this is
-            const prevRow = socketData[rowIndex - 1];
-            const nextRow = socketData[rowIndex + 1];
-            
-            const findDPNumbers = (r: any[]) => r?.filter(c => typeof c === 'number' || (!isNaN(parseInt(c)) && parseInt(c) > 0));
-            const dpNumsPrev = findDPNumbers(prevRow);
-            const dpNumsNext = findDPNumbers(nextRow);
+          // Check for Block 2 (DP 25 up to 48)
+          const isBlock2Row = row.some(cell => String(cell) === '25') && row.some(cell => String(cell) === '48');
+          if (!foundBlock2 && isBlock2Row) {
+            const dpRow = row;
+            const nameRow = socketData[r - 1] || []; // Names are above DP row in block 2
+            const typeRow = socketData[r + 1] || [];
+            const naRow = socketData[r + 2] || [];
+            const valueRow = socketData[r + 3] || [];
 
-            if (dpNumsPrev && dpNumsPrev.length > 10) {
-              // This row corresponds to DP numbers in prevRow
-              dpNumsPrev.forEach((dp, colIndex) => {
-                const dpNum = parseInt(dp.toString());
-                if (dpNum >= 1 && dpNum <= 48) {
-                  const pinNameRaw = row[colIndex]?.toString().replace(/<|>/g, '') || '';
-                  const pinName = pinNameRaw.toUpperCase() === 'RESET' ? 'PRESET' : pinNameRaw;
-                  if (pinName) newSocket[dpNum - 1] = { ...newSocket[dpNum - 1], name: pinName };
+            dpRow.forEach((cell, cIdx) => {
+              const dp = parseInt(String(cell));
+              if (!isNaN(dp) && dp >= 25 && dp <= 48) {
+                const name = cleanPinName(String(nameRow[cIdx] || ''));
+                const type = String(typeRow[cIdx] || '').trim();
+                const na = String(naRow[cIdx] || '').trim();
+                const value = String(valueRow[cIdx] || '').trim();
+
+                if (name) {
+                  newSocket[dp - 1] = { id: dp, name, type, na, value };
+                  const validTypes = ['PWR_PIN', 'INPUT_PIN', 'IO_PIN', 'GND_PIN'];
+                  if (type && !validTypes.includes(type)) {
+                    socketWarnings.push(`DP${dp} (${name}) has non-standard type: "${type}"`);
+                  }
                 }
-              });
-            } else if (dpNumsNext && dpNumsNext.length > 10) {
-              // This row corresponds to DP numbers in nextRow
-              dpNumsNext.forEach((dp, colIndex) => {
-                const dpNum = parseInt(dp.toString());
-                if (dpNum >= 1 && dpNum <= 48) {
-                  const pinNameRaw = row[colIndex]?.toString().replace(/<|>/g, '') || '';
-                  const pinName = pinNameRaw.toUpperCase() === 'RESET' ? 'PRESET' : pinNameRaw;
-                  if (pinName) newSocket[dpNum - 1] = { ...newSocket[dpNum - 1], name: pinName };
-                }
-              });
-            }
+              }
+            });
+            foundBlock2 = true;
+          }
+        }
+        
+        // Handle address mapping separately if find cells labeled 'X' or 'Y'
+        socketData.forEach(row => {
+          if (!row || row.length === 0) return;
+          const firstCell = row[0]?.toString().trim().toUpperCase();
+          if (firstCell === 'X') {
+            newMapping.x = { msb: row[1]?.toString() || 'PA8', lsb: row[2]?.toString() || 'PA4' };
+          } else if (firstCell === 'Y') {
+            newMapping.y = { msb: row[1]?.toString() || 'PA3', lsb: row[2]?.toString() || 'PA0' };
           }
         });
+
+        setState(prev => ({
+          ...prev,
+          socket: newSocket,
+          addressMapping: newMapping,
+          socketWarnings
+        }));
       }
 
       // Process Power Sheet
@@ -703,6 +814,7 @@ ON_FAIL={reconnect_io_seq};
         qData: newQData,
         powerUpSequence: newPowerUpSequence,
         readModeParams: newReadModeParams,
+        pgmMode: newPgmMode,
         mgnReadData: newMgnReadData,
         periods: newPeriods,
         tests: newTests,
@@ -718,41 +830,40 @@ ON_FAIL={reconnect_io_seq};
     let code = '/* Generated Test Program */\n\n';
 
     // generate Socket
-    // Socket
     code += '#ifdef Wafer\n';
     code += 'SOCKET single = {\n';
-    state.socket.forEach(pin => {
-      let line = `\t\tDP${pin.id} =	${pin.name},\t\t${pin.type}`;
-      if (pin.type !== 'GND_PIN') {
-        line += `,\t\t${pin.na || 'NA'},\t\t${pin.value || '0'}`;
+    state.socket.forEach((pin, idx) => {
+      if (pin.name) {
+        const type = pin.type || 'NA';
+        if (type === 'GND_PIN') {
+          code += `\t\tDP${idx + 1} =   ${pin.name},   ${type};\n`;
+        } else {
+          const na = pin.na || 'NA';
+          const val = pin.value || '0';
+          code += `\t\tDP${idx + 1} =   ${pin.name},   ${type},    ${na},    ${val};\n`;
+        }
       }
-      code += `${line}${pin.id === 48 ? ';' : ';'}\n`;
     });
     code += '};\n';
     code += '#endif Wafer\n\n';
 
-    const genSocket = (label: string, values: (string | number | undefined)[]) => {
-      let s = `#ifdef ${label}\n`;
-      s += 'SOCKET single = {\n';
-      state.socket.forEach((pin, idx) => {
-        let line = `\t\tDP${pin.id} =	${pin.name},\t\t${pin.type}`;
-        if (pin.type !== 'GND_PIN') {
-          const val = values[idx] !== undefined ? values[idx] : (pin.value || '0');
-          line += `,\t\t${pin.na || 'NA'},\t\t${val}`;
+    // generate PK2 Socket
+    code += '#ifdef PK2\n';
+    code += 'SOCKET single = {\n';
+    state.socket.forEach((pin, idx) => {
+      if (pin.name) {
+        const type = pin.type || 'NA';
+        if (type === 'GND_PIN' || type === 'PWR_PIN') {
+          code += `\t\tDP${idx + 1} =   ${pin.name},   ${type};\n`;
+        } else {
+          const na = pin.na || 'NA';
+          const val = pin.value || '0';
+          code += `\t\tDP${idx + 1} =   ${pin.name},   ${type},    ${na},    ${val};\n`;
         }
-        s += `${line};\n`;
-      });
-      s += '};\n';
-      s += `#endif ${label}\n\n`;
-      return s;
-    };
-
-    const pk2Values = ['VCC1', '12', '9', '8', '7', '6', '3', '2', '5', 'VPP0', undefined, 'VCC0', '42', '43', '46', '47', '44', '45', '40', '41', '38', '39', '36', '37', '34', '35', '32', '33', '30', '31', '26', '27', '28', '29', '24', '25', '19', '18', '23', '22', '21', '20', '17', '16', '15', '14', '11', undefined];
-    const pk1Values = ['VCC1', '37', '38', '39', '40', '41', '42', '43', '44', 'VPP0', undefined, 'VCC0', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26', '27', '28', '29', '30', '31', '32', '33', '34', undefined];
-
-    code += genSocket('PK2', pk2Values);
-    code += genSocket('PK1', pk1Values);
-    code += genSocket('QFP', pk2Values);
+      }
+    });
+    code += '};\n';
+    code += '#endif PK2\n\n';
     
     // generate Variables
     // Variables
@@ -1577,9 +1688,8 @@ ON_FAIL={reconnect_io_seq};
 
     const powerUpLines = (delay: string) => powerUpDps.map(dps => `\tSET(${dps},MAIN),\n\tDELAY(${delay})`).join('\n');
     const powerDownLines = (delay: string) => powerDownDps.map(dps => `\t${dps.toLowerCase()}_0v_dps,\n\tSET(${dps},MAIN),\n\tDELAY(${delay})`).join('\n');
+    const powerDownOpen = (delay: string) => powerDownDps.map(dps => `\tSET(${dps},OPEN),\n\tDELAY(${delay})`).join('\n');
 
-    code += `SEQUENCE vcc_short_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerUpLines('10ms')}\n};\n\n`;
-    
     // PMUTEST
     const powerPins = state.socket.filter(p => p.type === 'PWR_PIN').map(p => ({
       name: p.name,
@@ -1602,13 +1712,15 @@ ON_FAIL={reconnect_io_seq};
     code += `PMUTEST outputleakage_lo_pmu ={PINS = ALL_IO;FORCE = 0.0V;ULIMIT = 1.0uA ;LLIMIT =-1.0uA;RANGE = R2.5UA  ;DELAY = 1ms;SAMPLES=256;   PINMODE = SEQ;};\n`;
     code += '\n';
 
+    code += `SEQUENCE vcc_short_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerUpLines('10ms')}\n};\n\n`;
+    
     code += `SEQUENCE continuity_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerUpLines('10ms')}\n\tDELAY(5ms)\n};\n\n`;
     code += `SEQUENCE inputleakage_lo_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerUpLines('10ms')}\n\tSET(INPUTS1,VIH),\n\tSET(TESTIO,OPEN),\n\tSET(DOUT,OPEN),\n\tDELAY(1ms)\n};\n\n`;
     code += `SEQUENCE inputleakage_hi_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerUpLines('10ms')}\n\tSET(INPUTS1,VIL),\n\tSET(TESTIO,OPEN),\n\tSET(DOUT,OPEN),\n\tDELAY(1ms)\n};\n\n`;
     code += `SEQUENCE outputleakage_lo_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerUpLines('10ms')}\n\tSET(TESTIO,OPEN),\n\tSET(DOUT,VIH),\n\tDELAY(1ms)\n};\n\n`;
     code += `SEQUENCE outputleakage_hi_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerUpLines('10ms')}\n\tSET(TESTIO,OPEN),\n\tSET(DOUT,VIL),\n\tDELAY(1ms)\n};\n\n`;
     code += `SEQUENCE vcc_seq = {\n\tSET(ALL_PIN,VIL),\n\tDELAY(1ms),\n${powerUpLines('10ms')}\n\tSET(CBIAS_PIN,VIH),\n\tSET(TESTIO,HIZ),\n\tSET(DOUT,HIZ),\n\tDELAY(2ms)\n};\n\n`;
-    code += `SEQUENCE reconnect_io_seq = {\n\tPG_STOP,\n\tDELAY(1ms),\n\tzero_lev,\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerDownLines('10ms')}\n\tDELAY(10ms)\n};\n\n`;
+    code += `SEQUENCE reconnect_io_seq = {\n\tPG_STOP,\n\tDELAY(1ms),\n\tzero_lev,\n\tSET(ALL_PIN,VIL),\n\tDELAY(10ms),\n${powerDownLines('10ms')}\n${powerDownOpen('1ms')}\n};\n\n`;
 
 
     code += `SEQUENCE shmoo_iptaa_seq ={\n`;
@@ -1735,6 +1847,24 @@ ON_FAIL={reconnect_io_seq};
       code += `};\n\n`;
     });
     
+    // generate BINTABLE
+    code += 'BINTABLE bins = {\n';
+    code += '//Bin	,	hard	,	soft	,	P/F\n';
+    for (let i = 1; i <= 128; i++) {
+        if (i === 1) {
+            code += `Bin${i} 	,	1	,	1 	,	PASS	;\n`;
+        } else if (i === 2) {
+            code += `Bin${i} 	,	2	,	2 	,	FAIL	;\n`;
+        } else if (i <= 29) {
+            code += `Bin${i}	,	3	,	${i}	,	FAIL	;\n`;
+        } else if (i === 30) {
+            code += `Bin${i}	,	3 	,	30	,	FAIL	;\n`;
+        } else {
+            code += `Bin${i}	,	3	,	${i}	,	FAIL	;\n`;
+        }
+    }
+    code += '};\n\n';
+
     // generate FLOW
     state.flows.forEach(flow => {
       code += `FLOW ${flow.name} =	{\n`;
@@ -1764,17 +1894,119 @@ ON_FAIL={reconnect_io_seq};
     code += `        cga_mask(z)=0x00\n`;
     code += `     );\n\n`;
     code += `default:(driveAG=cga,driveDG=cga);\n`;
-    code += `      Q_init_cyc();\n`;
     
+    const maxYStr = getBitRange(state.addressMapping.y.msb, state.addressMapping.y.lsb);
+    const maxYValue = parseInt(maxYStr.substring(2), 16); 
+
     state.qData.forEach((entry, idx) => {
       const n = state.qData.length;
-      const startBit = (n - idx) * 8 - 1;
-      const endBit = startBit - 7;
-      code += `      Q_set_cyc(data=${entry.name});   //Q<${startBit}:${endBit}>\n`;
+      const startBit = entry.startBit !== undefined ? entry.startBit : (n - idx) * 8 - 1;
+      const endBit = entry.endBit !== undefined ? entry.endBit : startBit - 7;
+      
+      const axNum = parseInt(entry.addressX || '0');
+      const ayNum = parseInt(entry.addressY || '0');
+      
+      if (ayNum > maxYValue) {
+        code += `      // WARNING: adressY (${ayNum}) exceeds MAX_Y (${maxYValue})\n`;
+      }
+
+      const axHex = `0x${axNum.toString(16).toUpperCase().padStart(2, '0')}`;
+      const ayHex = `0x${ayNum.toString(16).toUpperCase().padStart(2, '0')}`;
+
+      if (idx === 0) {
+        code += `      Q_init_cyc(cga(x)=${axHex},cga(y)=${ayHex});\n`;
+      } else {
+        code += `      Q_set_cyc(data=${entry.name},cga(x)=${axHex},cga(y)=${ayHex});   //Q<${startBit}:${endBit}>\n`;
+      }
     });
     
     code += `      Q_end_cyc()stop;\n};\n`;
+    return code;
+  };
 
+  const generatePgm00Code = (timeStr: string, dataType: string) => {
+    const timeNum = parseInt(timeStr.replace(/\D/g, '')) || 90;
+    const periodNum = parseInt(state.pgmMode.period.replace(/\D/g, '')) || 10;
+    const loop0 = Math.max(0, Math.floor(timeNum / periodNum) - 1);
+    const powerSwitch = state.pgmMode.powerSwitch.toLowerCase() === 'yes';
+    const isDbm = dataType === 'hex_dbm';
+
+    // Construct pattern name base from data type
+    let nameDataPart = '00';
+    if (dataType === 'hex_dbm') {
+      nameDataPart = 'ckbd_io55'; // Using the sample code's name part for DBM
+    } else if (dataType.startsWith('0x')) {
+      nameDataPart = dataType.substring(2).toUpperCase();
+    } else {
+      nameDataPart = dataType;
+    }
+
+    let code = `import fuse_7220.ktl\nimport dgsets.kpl\n\n`;
+    
+    if (isDbm) {
+      code += `PG_STATIC {\n     PG(1);\n     pmode(DBM);\n     steering(y_link_to_x, by8);\n};\n\n`;
+      code += `DG_SET hex_dbm {\n     OutputSource = PG1DBMD;\n};\n\n`;
+    } else {
+      code += `PG_STATIC {\n     PG(2);\n     pmode(ECR);\n     steering(y_link_to_x, by8);\n};\n\n`;
+    }
+
+    code += `PG_PATTERN program${nameDataPart}_${timeStr}_chip_pat {\n\n`;
+    code += `    INIT: ( \n`;
+    code += `        cga(x)=0x0,\n`;
+    code += `        cga(y)=0x0,\n`;
+    code += `        cga(z)=0x0,\n\n`;
+    
+    code += `        cga_cmp(x)=MAX_X,\n`;
+    code += `        cga_cmp(y)=MAX_Y,\n`;
+    code += `        cga_cmp(z)=0x0,\n\n`;
+
+    code += `        cga_mask(x)=MAX_X,\n`;
+    code += `        cga_mask(y)=MAX_Y,\n`;
+    code += `        cga_mask(z)=0x0,\n\n`;
+
+    code += `repeatCnt =9999,\n`;
+    code += `loop(0)=${loop0}\n`;
+    code += `);\n`;
+    code += `default:(driveAG=cga,driveDG=cga);\n\n`;
+
+    if (!powerSwitch) {
+        code += `pgm_init_cyc(data=0xff,cga(x)=0x00,cga(y)=0x00);\n\n`;
+    }
+
+    code += `noop_cyc(data=0xff,cga(x)=0x00,cga(y)=0x00);\n`;
+    code += `noop_cyc(setDPSControl(VPP0,alt,bpoff));\n`;
+    code += `noop_cyc(setDPSControl(VPP0,alt,bpoff));\n`;
+    code += `noop_cyc(setDPSControl(VPP0,alt,bpoff));\n`;
+    code += `noop_cyc(data=0xff);\n`;
+    code += `noop_cyc(data=0xff) rept;\n\n`;
+
+    code += `pgm_init_cyc(data=0xff,cga(x)=0x00,cga(y)=0x00);\n`;
+    code += `do {\n`;
+    code += `\tpgm_set_cyc(link cga(x,y), data=0xff);\n`;
+    code += `\tdo {\n`;
+    
+    // Data syntax based on type
+    if (isDbm) {
+      code += `\t\tpgm_${state.pgmMode.period}_cyc(link cga(x,y), DG_SET=hex_dbm);\n`;
+    } else if (dataType.startsWith('0x')) {
+      code += `\t\tpgm_${state.pgmMode.period}_cyc(link cga(x,y), data=${dataType});\n`;
+    } else {
+      code += `\t\tpgm_${state.pgmMode.period}_cyc(link cga(x,y), DG_SET=${dataType});\n`;
+    }
+
+    code += `\t\t}while(loop(0));\n`;
+    code += `\tpgm_set_cyc(link cga(x,y), ++cga(x,y), data=0xff);\n`;
+    code += `\t} while(cga(x,y)!=cga_cmp(x,y));\n\n`;
+    if (powerSwitch) {
+        code += `pgm_end_cyc(data=0xff);\n\n`;
+    }
+    code += `noop_cyc(setDPSControl(VPP0,main,bpoff));\n`;
+    code += `noop_cyc(setDPSControl(VPP0,main,bpoff));\n`;
+    code += `noop_cyc(setDPSControl(VPP0,main,bpoff));\n`;
+    code += `noop_cyc(data=0xff)rept;\n`;
+    code += `noop_cyc(data=0xff);\n`;
+    code += `pgm_end_cyc(data=0xff)stop;\n`;
+    code += `};`;
 
     return code;
   };
@@ -1954,7 +2186,8 @@ ON_FAIL={reconnect_io_seq};
 
   const renderVariables = () => {
     const maxX = getBitRange(state.addressMapping.x.msb, state.addressMapping.x.lsb);
-    const maxY = getBitRange(state.addressMapping.y.msb, state.addressMapping.y.lsb);
+    const maxYStr = getBitRange(state.addressMapping.y.msb, state.addressMapping.y.lsb);
+    const maxY = parseInt(maxYStr.substring(2), 16);
 
     return (
       <div className="space-y-8 pb-20">
@@ -1971,7 +2204,7 @@ ON_FAIL={reconnect_io_seq};
             </div>
             <div className="p-4 bg-white border border-zinc-200 rounded-xl shadow-sm space-y-1">
               <label className="text-[10px] uppercase text-zinc-400 font-bold">MAX_Y</label>
-              <div className="text-sm font-mono font-bold text-zinc-900">{maxY}</div>
+              <div className="text-sm font-mono font-bold text-zinc-900">{maxYStr}</div>
             </div>
             <div className="p-4 bg-white border border-zinc-200 rounded-xl shadow-sm space-y-1">
               <label className="text-[10px] uppercase text-zinc-400 font-bold">FIX_X</label>
@@ -1990,25 +2223,70 @@ ON_FAIL={reconnect_io_seq};
             <h3 className="text-sm font-bold uppercase tracking-widest text-zinc-400">Q Option Data</h3>
             <span className="text-[10px] text-zinc-400 italic">Parsed from "Q option" Excel sheet</span>
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
-            {state.qData.map((entry, idx) => (
-              <div key={idx} className="p-3 bg-white border border-zinc-200 rounded-xl shadow-sm space-y-1">
-                <label className="text-[8px] uppercase text-zinc-400 font-bold">{entry.name}</label>
-                <div className="flex items-center gap-1">
-                  <span className="text-[10px] text-zinc-400 font-mono">0x</span>
-                  <input 
-                    className="w-full bg-transparent border-none p-0 text-xs font-mono focus:ring-0 outline-none"
-                    value={entry.value}
-                    maxLength={2}
-                    onChange={(e) => {
-                      const newList = [...state.qData];
-                      newList[idx] = { ...newList[idx], value: e.target.value.toUpperCase().replace(/[^0-9A-F]/g, '') };
-                      setState({ ...state, qData: newList });
-                    }}
-                  />
-                </div>
-              </div>
-            ))}
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse bg-white border border-zinc-200 rounded-xl shadow-sm">
+              <thead>
+                <tr className="bg-zinc-50 border-b border-zinc-100">
+                  <th className="px-4 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Name</th>
+                  <th className="px-4 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Value (Hex)</th>
+                  <th className="px-4 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest">adressX</th>
+                  <th className="px-4 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest">adressY</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-50">
+                {state.qData.map((entry, idx) => (
+                  <tr key={idx} className="hover:bg-zinc-50/50 transition-colors">
+                    <td className="px-4 py-2 text-xs font-bold text-zinc-600">{entry.name}</td>
+                    <td className="px-4 py-2">
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-zinc-400 font-mono">0x</span>
+                        <input 
+                          className="w-16 bg-zinc-50 border border-zinc-100 rounded px-2 py-1 text-xs font-mono focus:ring-0 outline-none"
+                          value={entry.value}
+                          maxLength={2}
+                          onChange={(e) => {
+                            const newList = [...state.qData];
+                            newList[idx] = { ...newList[idx], value: e.target.value.toUpperCase().replace(/[^0-9A-F]/g, '') };
+                            setState({ ...state, qData: newList });
+                          }}
+                        />
+                      </div>
+                    </td>
+                    <td className="px-4 py-2">
+                       <input 
+                        className="w-20 bg-zinc-50 border border-zinc-100 rounded px-2 py-1 text-xs font-mono focus:ring-0 outline-none"
+                        value={entry.addressX}
+                        onChange={(e) => {
+                          const newList = [...state.qData];
+                          newList[idx] = { ...newList[idx], addressX: e.target.value.replace(/\D/g, '') };
+                          setState({ ...state, qData: newList });
+                        }}
+                      />
+                    </td>
+                    <td className="px-4 py-2">
+                       <input 
+                        className="w-20 bg-zinc-50 border border-zinc-100 rounded px-2 py-1 text-xs font-mono focus:ring-0 outline-none"
+                        value={entry.addressY}
+                        onChange={(e) => {
+                          const ayValue = e.target.value.replace(/\D/g, '');
+                          const ay = parseInt(ayValue || '0');
+                          if (ay > maxY) {
+                            // Find a way to show toast? For now just visual cue or console.
+                            console.warn(`adressY (${ay}) exceeds MAX_Y (${maxY})`);
+                          }
+                          const newList = [...state.qData];
+                          newList[idx] = { ...newList[idx], addressY: ayValue };
+                          setState({ ...state, qData: newList });
+                        }}
+                      />
+                      {parseInt(entry.addressY || '0') > maxY && (
+                        <span className="ml-2 text-[8px] text-red-500 font-bold uppercase">! Exceeds MAX_Y</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
 
@@ -2105,12 +2383,17 @@ ON_FAIL={reconnect_io_seq};
       'InputLeakageLow',
       'OutputLeakageHigh',
       'OutputLeakageLow',
-      ...state.tests.map(t => t.name)
-    ];
+      'read_dbm_chip_vtyp_test',
+      'pgm00_vpp_max_test',
+      'pgm00_vpp_min_test',
+      'pgm00_vpp_typ_test',
+      ...state.tests.map(t => t.name),
+      ...state.mgnReadData.map(mgn => `readff_chip_${mgn.name.toLowerCase()}_test`)
+    ].filter((v, i, a) => a.indexOf(v) === i); // Deduplicate
 
     const allBranches = [
       ...allTests,
-      ...Array.from({ length: 100 }, (_, i) => `Bin${i + 1}`)
+      ...Array.from({ length: 128 }, (_, i) => `Bin${i + 1}`)
     ];
 
     return (
@@ -2140,8 +2423,9 @@ ON_FAIL={reconnect_io_seq};
                     <Activity size={20} className="text-zinc-900" />
                   </div>
                   <input 
-                    className="text-lg font-bold bg-transparent border-none focus:ring-0 outline-none"
+                    className="text-lg font-bold bg-transparent border-b border-transparent hover:border-zinc-200 focus:border-zinc-900 focus:ring-0 outline-none transition-all px-1"
                     value={flow.name}
+                    placeholder="Enter Flow Name..."
                     onChange={(e) => {
                       const newFlows = [...state.flows];
                       newFlows[fIdx].name = e.target.value;
@@ -2150,15 +2434,19 @@ ON_FAIL={reconnect_io_seq};
                   />
                 </div>
                 <button 
-                  onClick={() => setState({ ...state, flows: state.flows.filter((_, i) => i !== fIdx) })}
+                  onClick={() => {
+                    if (confirm(`Delete flow "${flow.name}"?`)) {
+                      setState({ ...state, flows: state.flows.filter((_, i) => i !== fIdx) });
+                    }
+                  }}
                   className="text-zinc-400 hover:text-red-500 transition-colors"
                 >
                   <Trash2 size={18} />
                 </button>
               </div>
 
-              <div className="overflow-hidden border border-zinc-100 rounded-xl">
-                <table className="w-full text-left border-collapse">
+              <div className="overflow-x-auto border border-zinc-100 rounded-xl">
+                <table className="w-full text-left border-collapse min-w-[600px]">
                   <thead>
                     <tr className="bg-zinc-50 border-b border-zinc-100">
                       <th className="px-4 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Test Name</th>
@@ -2172,7 +2460,7 @@ ON_FAIL={reconnect_io_seq};
                       <tr key={eIdx} className="hover:bg-zinc-50/50 transition-colors">
                         <td className="px-4 py-2">
                           <select 
-                            className="w-full bg-transparent border-none text-xs font-mono focus:ring-0"
+                            className="w-full bg-zinc-50 border border-zinc-100 rounded px-2 py-1.5 text-[11px] font-mono focus:ring-1 focus:ring-zinc-400 outline-none"
                             value={entry.testName}
                             onChange={(e) => {
                               const newFlows = [...state.flows];
@@ -2185,7 +2473,7 @@ ON_FAIL={reconnect_io_seq};
                         </td>
                         <td className="px-4 py-2">
                           <select 
-                            className="w-full bg-transparent border-none text-xs font-mono focus:ring-0"
+                            className="w-full bg-zinc-50 border border-zinc-100 rounded px-2 py-1.5 text-[11px] font-mono focus:ring-1 focus:ring-zinc-400 outline-none"
                             value={entry.passBranch}
                             onChange={(e) => {
                               const newFlows = [...state.flows];
@@ -2198,7 +2486,7 @@ ON_FAIL={reconnect_io_seq};
                         </td>
                         <td className="px-4 py-2">
                           <select 
-                            className="w-full bg-transparent border-none text-xs font-mono focus:ring-0"
+                            className="w-full bg-zinc-50 border border-zinc-100 rounded px-2 py-1.5 text-[11px] font-mono focus:ring-1 focus:ring-zinc-400 outline-none"
                             value={entry.failBranch}
                             onChange={(e) => {
                               const newFlows = [...state.flows];
@@ -2249,37 +2537,77 @@ ON_FAIL={reconnect_io_seq};
   };
 
   const renderSocket = () => (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-      {state.socket.map((pin, idx) => (
-        <div key={pin.id} className="p-4 bg-white border border-zinc-200 rounded-lg shadow-sm hover:border-zinc-400 transition-colors">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-mono text-zinc-400">DP{pin.id}</span>
-            <input 
-              className="text-sm font-semibold bg-transparent border-none focus:ring-0 text-right w-24"
-              value={pin.name}
-              onChange={(e) => {
-                const newSocket = [...state.socket];
-                newSocket[idx].name = e.target.value;
-                setState({ ...state, socket: newSocket });
-              }}
-            />
+    <div className="space-y-6">
+      {state.socketWarnings && state.socketWarnings.length > 0 && (
+        <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg">
+          <div className="flex items-center gap-2 text-amber-800 mb-2">
+            <Activity size={16} />
+            <span className="font-bold text-sm uppercase tracking-wider">Socket Configuration Warnings</span>
           </div>
-          <select 
-            className="w-full text-xs bg-zinc-50 border-zinc-200 rounded p-1"
-            value={pin.type}
-            onChange={(e) => {
-              const newSocket = [...state.socket];
-              newSocket[idx].type = e.target.value;
-              setState({ ...state, socket: newSocket });
-            }}
-          >
-            <option value="POWER_PIN">POWER_PIN</option>
-            <option value="INPUT_PIN">INPUT_PIN</option>
-            <option value="IO_PIN">IO_PIN</option>
-            <option value="OUTPUT_PIN">OUTPUT_PIN</option>
-          </select>
+          <ul className="list-disc list-inside space-y-1">
+            {state.socketWarnings.map((warning, idx) => (
+              <li key={idx} className="text-xs text-amber-700 font-mono">{warning}</li>
+            ))}
+          </ul>
         </div>
-      ))}
+      )}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {state.socket.map((pin, idx) => (
+          <div key={pin.id} className="p-4 bg-white border border-zinc-200 rounded-lg shadow-sm hover:border-zinc-400 transition-colors">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-mono text-zinc-400">DP{pin.id}</span>
+              <input 
+                className="text-sm font-semibold bg-transparent border-none focus:ring-0 text-right w-24"
+                value={pin.name}
+                onChange={(e) => {
+                  const newSocket = [...state.socket];
+                  newSocket[idx].name = e.target.value;
+                  setState({ ...state, socket: newSocket });
+                }}
+              />
+            </div>
+            <div className="space-y-2">
+              <select 
+                className="w-full text-xs bg-zinc-50 border-zinc-200 rounded p-1"
+                value={pin.type}
+                onChange={(e) => {
+                  const newSocket = [...state.socket];
+                  newSocket[idx].type = e.target.value;
+                  setState({ ...state, socket: newSocket });
+                }}
+              >
+                <option value="PWR_PIN">PWR_PIN</option>
+                <option value="INPUT_PIN">INPUT_PIN</option>
+                <option value="IO_PIN">IO_PIN</option>
+                <option value="GND_PIN">GND_PIN</option>
+                <option value="OUTPUT_PIN">OUTPUT_PIN</option>
+              </select>
+              <div className="grid grid-cols-2 gap-2">
+                <input 
+                  placeholder="NA/DPS"
+                  className="p-1 text-[10px] bg-zinc-50 border border-zinc-100 rounded"
+                  value={pin.na || ''}
+                  onChange={(e) => {
+                    const newSocket = [...state.socket];
+                    newSocket[idx].na = e.target.value;
+                    setState({ ...state, socket: newSocket });
+                  }}
+                />
+                <input 
+                  placeholder="Value"
+                  className="p-1 text-[10px] bg-zinc-50 border border-zinc-100 rounded"
+                  value={pin.value || ''}
+                  onChange={(e) => {
+                    const newSocket = [...state.socket];
+                    newSocket[idx].value = e.target.value;
+                    setState({ ...state, socket: newSocket });
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 
@@ -2581,6 +2909,125 @@ ON_FAIL={reconnect_io_seq};
     </div>
   );
 
+  const renderPgm00Preview = () => {
+    const timeStr = pgm00SelectedTime === 'min' ? state.pgmMode.pgmTimeMin : state.pgmMode.pgmTimeMax;
+    const dataTypes = ['0x00', '0xff', 'ckbd_io55', 'ckbd_io00', 'ckbd_ioaa', 'ickbd_io00', 'hex_dbm'];
+    const displayLabel = `pgm ${pgm00SelectedDataType.startsWith('0x') ? pgm00SelectedDataType.substring(2) : pgm00SelectedDataType} ${pgm00SelectedTime} preview`;
+
+    return (
+      <div className="space-y-4 h-full flex flex-col">
+        <div className="p-6 bg-white border border-zinc-200 rounded-xl shadow-sm space-y-6">
+          <div className="space-y-4">
+            <h3 className="text-sm font-bold uppercase tracking-widest text-zinc-400">PGM 00 Configuration</h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div>
+                <label className="block text-[10px] font-bold text-zinc-400 uppercase mb-1">Power Switch</label>
+                <select 
+                  className="w-full bg-zinc-50 border border-zinc-100 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-zinc-900 outline-none"
+                  value={state.pgmMode.powerSwitch}
+                  onChange={(e) => setState({ ...state, pgmMode: { ...state.pgmMode, powerSwitch: e.target.value } })}
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[10px] font-bold text-zinc-400 uppercase mb-1">PGM Time Min</label>
+                <input 
+                  className="w-full bg-zinc-50 border border-zinc-100 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-zinc-900 outline-none"
+                  value={state.pgmMode.pgmTimeMin}
+                  onChange={(e) => setState({ ...state, pgmMode: { ...state.pgmMode, pgmTimeMin: e.target.value } })}
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-bold text-zinc-400 uppercase mb-1">PGM Time Max</label>
+                <input 
+                  className="w-full bg-zinc-50 border border-zinc-100 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-zinc-900 outline-none"
+                  value={state.pgmMode.pgmTimeMax}
+                  onChange={(e) => setState({ ...state, pgmMode: { ...state.pgmMode, pgmTimeMax: e.target.value } })}
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-bold text-zinc-400 uppercase mb-1">Period</label>
+                <input 
+                  className="w-full bg-zinc-50 border border-zinc-100 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-zinc-900 outline-none"
+                  value={state.pgmMode.period}
+                  onChange={(e) => setState({ ...state, pgmMode: { ...state.pgmMode, period: e.target.value } })}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-zinc-100">
+            <div>
+              <label className="block text-[10px] font-bold text-zinc-400 uppercase mb-2">Time Mode</label>
+              <div className="flex gap-2">
+                {['min', 'max'].map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setPgm00SelectedTime(t as 'min' | 'max')}
+                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                      pgm00SelectedTime === t 
+                        ? 'bg-zinc-900 text-white shadow-lg shadow-zinc-900/20' 
+                        : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200'
+                    }`}
+                  >
+                    {t.toUpperCase()} ({t === 'min' ? state.pgmMode.pgmTimeMin : state.pgmMode.pgmTimeMax})
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <label className="block text-[10px] font-bold text-zinc-400 uppercase mb-2">Data Type</label>
+              <div className="flex flex-wrap gap-2">
+                {dataTypes.map((dt) => (
+                  <button
+                    key={dt}
+                    onClick={() => setPgm00SelectedDataType(dt)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-mono transition-all ${
+                      pgm00SelectedDataType === dt 
+                        ? 'bg-zinc-900 text-white shadow-md shadow-zinc-900/20' 
+                        : 'bg-zinc-100 text-zinc-600 hover:bg-zinc-200'
+                    }`}
+                  >
+                    {dt}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex justify-between items-center">
+          <h2 className="text-lg font-semibold capitalize">{displayLabel}</h2>
+          <button 
+            onClick={() => {
+              const code = generatePgm00Code(timeStr, pgm00SelectedDataType);
+              const blob = new Blob([code], { type: 'text/plain' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              const fileName = displayLabel.replace(/\s+/g, '_');
+              a.download = `${fileName}_chip.pat`;
+              a.click();
+            }}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors shadow-lg shadow-blue-600/20"
+          >
+            <Download size={18} /> Download Code
+          </button>
+        </div>
+        <div className="flex-1 bg-zinc-900 rounded-xl p-6 overflow-auto border border-zinc-800 shadow-2xl relative">
+          <div className="absolute top-4 right-4 text-[10px] font-mono text-zinc-500 uppercase tracking-widest bg-black/50 px-2 py-1 rounded backdrop-blur-sm">
+            {displayLabel}
+          </div>
+          <pre className="text-zinc-300 font-mono text-sm leading-relaxed">
+            {generatePgm00Code(timeStr, pgm00SelectedDataType)}
+          </pre>
+        </div>
+      </div>
+    );
+  };
+
   const tabs = [
     { id: 'socket', label: 'Socket', icon: <Cpu size={18} /> },
     { id: 'pinGroups', label: 'Pin Group', icon: <Layers size={18} /> },
@@ -2594,6 +3041,7 @@ ON_FAIL={reconnect_io_seq};
     { id: 'mgnReadData', label: 'MGN Read', icon: <Table size={18} /> },
     { id: 'preview', label: 'Preview', icon: <FileCode size={18} /> },
     { id: 'setQPreview', label: 'Set Q Preview', icon: <FileCode size={18} /> },
+    { id: 'pgm00Preview', label: 'PGM 00 Preview', icon: <Cpu size={18} /> },
   ];
 
   return (
@@ -2800,6 +3248,7 @@ ON_FAIL={reconnect_io_seq};
             {activeTab === 'sequences' && renderSequences()}
             {activeTab === 'preview' && renderPreview()}
             {activeTab === 'setQPreview' && renderSetQPreview()}
+            {activeTab === 'pgm00Preview' && renderPgm00Preview()}
             {activeTab === 'variables' && renderVariables()}
             {activeTab === 'mgnReadData' && (
               <div className="space-y-8">

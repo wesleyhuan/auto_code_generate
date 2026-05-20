@@ -62,6 +62,22 @@ export interface FlowConfig {
   entries: FlowEntry[];
 }
 
+export interface QDataEntry {
+  name: string;
+  value: string;
+  addressX?: string;
+  addressY?: string;
+  startBit?: number;
+  endBit?: number;
+}
+
+export interface PgmModeData {
+  powerSwitch: string;
+  pgmTimeMin: string;
+  pgmTimeMax: string;
+  period: string;
+}
+
 export interface AppState {
   socket: PinConfig[];
   pinGroups: { name: string; pins: string[] }[];
@@ -87,13 +103,15 @@ export interface AppState {
     x: { msb: string; lsb: string };
     y: { msb: string; lsb: string };
   };
-  qData: { name: string; value: string }[];
+  qData: QDataEntry[];
   powerUpSequence: string[];
   readModeParams: {
     taa: number;
     period?: number;
     pinStatuses: { pin: string; status: string }[];
   };
+  pgmMode: PgmModeData;
   mgnReadData: MgnModeData[];
   periods: number[];
+  socketWarnings?: string[];
 }
